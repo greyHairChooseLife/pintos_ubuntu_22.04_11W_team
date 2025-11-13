@@ -215,14 +215,8 @@ thread_create (const char *name, int priority,
  /* Add to run queue. */
   thread_unblock (t);
 
-  // if (lock_held_by_current_thread(aux)) {
-  //   if (thread_current()->priority < priority) {
-  //     thread_current()->priority =
-  //   }
-  // }
-
   if (priority > thread_get_priority())
-           thread_yield();
+    thread_yield();
 
  return tid;
 }
@@ -257,7 +251,7 @@ thread_block (void) {
 bool more_mvp_func(const struct list_elem* a,const struct list_elem* b, void* aux) {
  struct thread *thread_a = list_entry(a, struct thread, elem);
  struct thread *thread_b = list_entry(b, struct thread, elem);
- return get_priority(thread_a) > get_priority(thread_b);
+ return thread_a->priority > thread_b->priority;
 }
 
 void
@@ -341,32 +335,21 @@ thread_yield (void) {
 void
 thread_recalculate_priority (struct thread *t)
 {
-    // 1. 자신의 기본(base) 우선순위로 시작
     int new_priority = t->base_priority;
 
-    // 2. 만약 donations 리스트가 비어있지 않다면,
-    //    (리스트가 정렬되어 있으므로) 맨 뒤(list_back)가 가장 높은 우선순위의 기부자임.
     if (!list_empty(&t->donations)) {
-        struct thread *highest_donor = list_entry(list_back(&t->donations), 
-                                                  struct thread, donation_elem);
-        
-        // 3. 가장 높은 기부자의 (유효) 우선순위와 비교
+        struct thread *highest_donor = list_entry(list_back(&t->donations), struct thread, donation_elem);
         if (highest_donor->priority > new_priority) {
             new_priority = highest_donor->priority;
         }
     }
-
-    // 4. 우선순위가 변경되었다면 업데이트하고,
-    //    이 변경을 *전파(propagate)* 시켜야 함.
+    // if priority is changed - it must be sent down the line
     if (t->priority != new_priority) {
         t->priority = new_priority;
-
-        // 5. (중첩 기부의 핵심)
-        //    만약 나(t)도 다른 스레드(holder)를 기다리고 있다면,
-        //    나의 우선순위가 바뀌었으니 holder의 우선순위도 재계산해야 함.
-        if (t->waiting_lock) {
+        // the lock the thread is waiting for must have a holder to donate
+        if (t->waiting_lock && t->waiting_lock->holder) {
             struct thread *holder = t->waiting_lock->holder;
-            if (holder) {
+            if (holder != t) {
                 thread_recalculate_priority(holder);
             }
         }
@@ -384,20 +367,18 @@ thread_get_priority (void) {
   return thread_current ()->priority;
 }
 
-/* * (priority-change 테스트를 위한) thread_set_priority 수정
- */
 void
 thread_set_priority (int new_priority) {
+    enum intr_level old_level = intr_disable();
     struct thread *curr = thread_current();
     curr->base_priority = new_priority; // 기본 우선순위를 변경
-
     // 기부받은 우선순위와 비교하여 유효 우선순위를 재계산
-    thread_recalculate_priority(curr); 
+    thread_recalculate_priority(curr);  // priority = max(new_priority, max_donor_priority)
 
-    // (필요한 경우) 우선순위가 가장 높은 스레드가 아니면 yield
-    // (이 부분은 스케줄러 정책에 따라 구현)
-    if (list_entry(list_front(&ready_list),struct thread, elem)->priority > curr->priority)
-       thread_yield();
+    if (!list_empty(&ready_list) &&
+        curr->priority < list_entry(list_front(&ready_list), struct thread, elem)->priority) 
+        thread_yield();
+    intr_set_level(old_level);
 }
 
 /* Sets the current thread's nice value to NICE. */
@@ -488,6 +469,7 @@ init_thread (struct thread *t, const char *name, int priority) {
    strlcpy (t->name, name, sizeof t->name);
    t->tf.rsp = (uint64_t) t + PGSIZE - sizeof (void *);
  t->priority = priority;
+ t->base_priority = priority;
  t->magic = THREAD_MAGIC;
  list_init(&t->donations);
  t->waiting_lock = NULL;
