@@ -159,7 +159,59 @@ error:
 
 void arg_passing(void* f_line, struct intr_frame *_if) 
 {
+    //f_line is basically a line of arguments seperated by spaces
+    // just set 12 as default for now
+    char * argv[12];
+    int argc = 0; // will increase the arg count as i split
+    char *arg_copy; // a seperate copy of filename for using strtok
+    // always good practice to make a copy to use strtok
+    arg_copy = palloc_get_page(0);
+    if (arg_copy == NULL)
+        return TID_ERROR; // is it necessary to return TID error here as well?
+    strlcpy(arg_copy, f_line, PGSIZE);
+
+    // start parsing now that copy complete
     
+    char *save_ptr;
+    char *token;
+    char *arg_address[12];
+    uintptr_t *esp = _if->rsp; // stack entry point
+
+    // must initialize strtok and fill up rest
+    token = strtok_r(arg_copy, ' ', &save_ptr);
+    esp-= strlen(token);
+    arg_address[0] = esp;
+    argc = 1;
+    // pushing in strings into stack
+
+    while (token = strtok_r(NULL, ' ', &save_ptr) != NULL) 
+    {
+        argv[argc] = token;
+        arg_address[argc] = esp; // not sure if this is the right way to 'push' the strings?
+        esp -= strlen(token)+1;
+        argc++;
+    }
+    // must add padding to align stack with word size before pushing in addresses of these argvs
+
+    while ((uintptr_t)esp%8 != 0) // im not sure if im ddoing this right
+        esp--; 
+
+    // parsing arguments into argv
+    int args = argc; // i can't directly change argc since i need to use it later to insert in to rdi
+    for (;args > 0; args--) { // until i got no arg count left
+        esp = arg_address[args]; 
+        esp -= strlen(arg_address[args]) + 1; // also include null pointer
+        // i think this is all i need to do?
+    }
+    // add in fake return address? of type void? 
+    esp = (uint64_t)0; // 
+
+
+    // i guess once i'm done filling in the stack, i should point the rsp towards argv[0]
+    // and also update argc on rdi
+    _if->rsp = esp;
+    _if->R.rsi = esp +8; // i guess argv comes right after the return address so..
+    _if->R.rdi = argc;
 
 }
 
