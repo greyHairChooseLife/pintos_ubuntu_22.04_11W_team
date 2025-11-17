@@ -87,6 +87,7 @@ typedef int tid_t;
 
 struct thread {
     /* Owned by thread.c. */
+
     tid_t tid;                      /* Thread identifier. */
     enum thread_status status;      /* Thread state. */
     char name[16];                  /* Name (for debugging purposes). */
@@ -127,6 +128,7 @@ extern struct list sleep_list;
 extern bool more_mvp_func(const struct list_elem* a, const struct list_elem* b, void* aux);
 extern int get_priority(struct thread* t);
 extern void thread_recalculate_priority(struct thread* t);
+
 
 void thread_init(void);
 void thread_start(void);
