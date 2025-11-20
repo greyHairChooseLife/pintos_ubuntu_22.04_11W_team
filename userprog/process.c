@@ -169,6 +169,48 @@ error:
 
 void arg_passing(void* f_line, struct intr_frame* _if)
 {
+    char* rsp = (char*)_if->rsp; // explicit cast necessary because rsp is uintptr_t
+
+    char* save_ptr; // used for strtok_r
+    char* token;
+    char* argv_addr[64]; // 128 is max arg length ==> 64 max args considering space in between each arg composed of
+                         // single characters
+    int argc = 0;        // counting number of args
+
+    // parse and push arguments into stack at the same time
+    // simultaneously add argv_address within stack
+    for (token = strtok_r(f_line, " ", &save_ptr); token != NULL; token = strtok_r(NULL, " ", &save_ptr)) {
+        int len = strlen(token) + 1;
+        rsp -= len;
+        memcpy(rsp, token, len);
+        argv_addr[argc++] = rsp;
+    }
+
+    // inserting padding if needed after finishing pushing in strings
+    int padding = (uintptr_t)rsp % 8;
+    if (padding > 0) {
+        rsp -= padding;
+        memset(rsp, 0, padding);
+    }
+
+    // insert sentinel argv[argc] = NULL;
+    rsp -= 8;
+    *(char**)rsp = 0;
+
+    // add in argv_address into rsp
+    for (int i = argc - 1; i >= 0; i--) {
+        rsp -= 8;                    // since addresses are 8 bytes
+        *(char**)rsp = argv_addr[i]; // argv_addr[i] is pointer to pointer of string rsp should be a pointer to that.
+    }
+
+    // insert fake address
+    rsp -= 8;
+    *(char**)rsp = 0;
+
+    // set register values
+    _if->R.rdi = argc;               // argc
+    _if->R.rsi = (uintptr_t)rsp + 8; // addr to argv[0]
+    _if->rsp = (uintptr_t)rsp;       // update top of stack
 }
 
 /* Switch the current execution context to the f_name.
