@@ -7,11 +7,16 @@
 #include "userprog/gdt.h"
 #include "threads/flags.h"
 #include "intrinsic.h"
+#include "threads/synch.h"
 
 void syscall_entry(void);
 void syscall_handler(struct intr_frame*);
 
+#define MAX_CHUNK 256 /* 콘솔 출력 청크 사이즈 */
+
+static struct lock lock;
 static void exit(int status);
+static int write(int fd, const void* buffer, unsigned size);
 
 /* System call.
  *
@@ -40,10 +45,23 @@ void syscall_init(void)
 void syscall_handler(struct intr_frame* f UNUSED)
 {
     int syscall_num = f->R.rax;
+    uint64_t rax = f->R.rax;
+    uint64_t arg1 = f->R.rdi;
+    uint64_t arg2 = f->R.rsi;
+    uint64_t arg3 = f->R.rdx;
+    uint64_t arg4 = f->R.r10;
+    uint64_t arg5 = f->R.r8;
+    uint64_t arg6 = f->R.r9;
+
+    lock_init(&lock);
 
     switch (syscall_num) {
+
     case SYS_EXIT:
-        exit(f->R.rdi);
+        exit(arg1);
+        break;
+    case SYS_WRITE:
+        f->R.rax = write(arg1, arg2, arg3);
         break;
     default:
         thread_exit();
@@ -55,4 +73,24 @@ static void exit(int status)
     struct thread* t = thread_current();
     t->exit_status = status;
     thread_exit();
+}
+
+int write(int fd, const void* buffer, unsigned size)
+{
+    lock_acquire(&lock); // race condition 방지
+    char* buf = (char*)buffer;
+
+    if (size <= MAX_CHUNK) {
+        putbuf(buf, size);
+    } else { // 256 이상은 분할 출력
+        size_t offset = 0;
+        while (offset < size) {
+            size_t chunk_size = size - offset < MAX_CHUNK ? size - offset : MAX_CHUNK;
+            putbuf(buf + offset, chunk_size);
+            offset += chunk_size;
+        }
+    }
+    lock_release(&lock);
+
+    return size;
 }
