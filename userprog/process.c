@@ -18,6 +18,8 @@
 #include "threads/mmu.h"
 #include "threads/vaddr.h"
 #include "intrinsic.h"
+#include "include/devices/timer.h"
+
 #ifdef VM
 #include "vm/vm.h"
 #endif
@@ -26,7 +28,6 @@ static void process_cleanup(void);
 static bool load(const char* file_name, struct intr_frame* if_);
 static void initd(void* f_name);
 static void __do_fork(void*);
-void get_file_name_only(const char* original_f_name, char* f_name_only, char** save_ptr);
 
 /* General process initializer for initd and other process. */
 static void process_init(void)
@@ -43,9 +44,6 @@ tid_t process_create_initd(const char* file_name)
 {
     char* fn_copy;
     tid_t tid;
-    char file_name_only[15], *save_ptr;
-
-    get_file_name_only(file_name, file_name_only, &save_ptr);
 
     /* Make a copy of FILE_NAME.
      * Otherwise there's a race between the caller and load(). */
@@ -54,10 +52,20 @@ tid_t process_create_initd(const char* file_name)
         return TID_ERROR;
     strlcpy(fn_copy, file_name, PGSIZE);
 
+    /* thread_name parsing logic necessary due to thread name size limit declared in thread.h */
+    /* this logic was chosen instead of strtok which damages original string */
+    char thread_name[16];               // thread_name length is max 15 bytes.
+    size_t len = strcspn(fn_copy, " "); // returns length of initial segment up til rejected character
+    if (len >= sizeof(thread_name))     // logic to prevent buffer over flow
+        len = sizeof(thread_name) - 1;
+
+    memcpy(thread_name, fn_copy, len); // copy name
+    thread_name[len] = '\0';           // implement null termination
+
     /* Create a new thread to execute FILE_NAME. */
-    tid = thread_create(file_name_only, PRI_DEFAULT, initd, fn_copy);
+    tid = thread_create(thread_name, PRI_DEFAULT, initd, fn_copy);
     if (tid == TID_ERROR)
-        palloc_free_page(file_name_only);
+        palloc_free_page(fn_copy);
     return tid;
 }
 
@@ -161,14 +169,56 @@ error:
     thread_exit();
 }
 
+void arg_passing(void* f_line, struct intr_frame* _if)
+{
+    char* rsp = (char*)_if->rsp; // explicit cast necessary because rsp is uintptr_t
+
+    char* save_ptr; // used for strtok_r
+    char* token;
+    char* argv_addr[64]; // 128 is max arg length ==> 64 max args considering space in between each arg composed of
+                         // single characters
+    int argc = 0;        // counting number of args
+
+    // parse and push arguments into stack at the same time
+    // simultaneously add argv_address within stack
+    for (token = strtok_r(f_line, " ", &save_ptr); token != NULL; token = strtok_r(NULL, " ", &save_ptr)) {
+        if (*token == '\0')
+            continue;
+        int len = strlen(token) + 1;
+        rsp -= len;
+        memcpy(rsp, token, len);
+        argv_addr[argc++] = rsp;
+    }
+
+    // inserting padding if needed after finishing pushing in strings
+    // no need to add 0 since when page_get_alloc, stack is zero-filled.
+    while ((uintptr_t)rsp % 8 != 0)
+        rsp--;
+
+    // insert sentinel argv[argc] = NULL;
+    rsp -= 8;
+
+    // add in argv_address into rsp
+    for (int i = argc - 1; i >= 0; i--) {
+        rsp -= 8;                    // since addresses are 8 bytes
+        *(char**)rsp = argv_addr[i]; // argv_addr[i] is pointer to pointer of string rsp should be a pointer to that.
+    }
+
+    // insert fake address
+    rsp -= 8;
+
+    // set register values
+    _if->R.rdi = argc;               // argc
+    _if->R.rsi = (uintptr_t)rsp + 8; // addr to argv[0]
+    _if->rsp = (uintptr_t)rsp;       // update top of stack
+}
+
 /* Switch the current execution context to the f_name.
  * Returns -1 on fail. */
 int process_exec(void* f_name)
 {
-    char file_name_only[15], *save_ptr;
+    char* file_name = f_name;
     bool success;
-
-    get_file_name_only(f_name, file_name_only, &save_ptr);
 
     /* We cannot use the intr_frame in the thread structure.
      * This is because when current thread rescheduled,
@@ -181,15 +231,25 @@ int process_exec(void* f_name)
     /* We first kill the current context */
     process_cleanup();
 
+    /* file name parsing logic necessary before passing on to load*/
+    /* same logic from parsing thread_name in process_create_initd */
+    char load_name[15];                   // load_name is max 14 bytes, +1 for null terminator
+    size_t len = strcspn(file_name, " "); // returns length of initial segment up til rejected character
+    if (len >= sizeof(load_name))         // logic to prevent buffer over flow
+        len = sizeof(load_name) - 1;
+
+    memcpy(load_name, file_name, len); // copy name
+    load_name[len] = '\0';             // implement null termination
     /* And then load the binary */
-    success = load(f_name, &_if);
-
-    // hex_dump(_if.rsp, _if.rsp, USER_STACK - (uint64_t)_if.rsp, true);
-
+    success = load(load_name, &_if);
     /* If load failed, quit. */
-    palloc_free_page(f_name);
     if (!success)
         return -1;
+
+    arg_passing(file_name, &_if);
+
+    // move palloc_free_page after arg_passing()
+    palloc_free_page(file_name);
 
     /* Start switched process. */
     do_iret(&_if);
@@ -210,9 +270,7 @@ int process_wait(tid_t child_tid UNUSED)
     /* XXX: Hint) The pintos exit if process_wait (initd), we recommend you
      * XXX:       to add infinite loop here before
      * XXX:       implementing the process_wait. */
-
     timer_sleep(100);
-
     return -1;
 }
 
@@ -221,8 +279,11 @@ void process_exit(void)
 {
     struct thread* curr = thread_current();
 
-    if (curr->pml4 != NULL) // 커널 스레드는 출력 x
-        printf("%s: exit(%d)\n", thread_current()->name, curr->tf.R.rax);
+// using preprocessor directives (전처리기 지시문) ==> 코드를 조건부로 컴파일.
+#ifdef USERPROG             // only if user program
+    if (curr->pml4 != NULL) // means thread running user code (kernel thread does not have user memory space pml4)
+        printf("%s: exit(%d)\n", curr->name, curr->exit_status);
+#endif
 
     process_cleanup();
 }
@@ -335,9 +396,6 @@ static bool load(const char* file_name, struct intr_frame* if_)
     off_t file_ofs;
     bool success = false;
     int i;
-    char *token, *save_ptr, file_name_only[15];
-
-    get_file_name_only(file_name, file_name_only, &save_ptr);
 
     /* Allocate and activate page directory. */
     t->pml4 = pml4_create();
@@ -346,9 +404,9 @@ static bool load(const char* file_name, struct intr_frame* if_)
     process_activate(thread_current());
 
     /* Open executable file. */
-    file = filesys_open(file_name_only);
+    file = filesys_open(file_name);
     if (file == NULL) {
-        printf("load: %s: open failed\n", file_name_only);
+        printf("load: %s: open failed\n", file_name);
         goto done;
     }
 
@@ -356,7 +414,7 @@ static bool load(const char* file_name, struct intr_frame* if_)
     if (file_read(file, &ehdr, sizeof ehdr) != sizeof ehdr || memcmp(ehdr.e_ident, "\177ELF\2\1\1", 7) ||
         ehdr.e_type != 2 || ehdr.e_machine != 0x3E // amd64
         || ehdr.e_version != 1 || ehdr.e_phentsize != sizeof(struct Phdr) || ehdr.e_phnum > 1024) {
-        printf("load: %s: error loading executable\n", file_name_only);
+        printf("load: %s: error loading executable\n", file_name);
         goto done;
     }
 
@@ -417,36 +475,8 @@ static bool load(const char* file_name, struct intr_frame* if_)
     /* Start address. */
     if_->rip = ehdr.e_entry;
 
-    int index = 0;
-    char* ptr = USER_STACK;
-    char* address[24] = {0};
-
-    // 인자 값 메모리에 넣기
-    for (token = strtok_r(file_name, " ", &save_ptr); token != NULL; token = strtok_r(NULL, " ", &save_ptr)) {
-        ptr -= (strlen(token) + 1);
-        strlcat(token, "\0", 1);
-        address[index++] = memcpy(ptr, token, strlen(token));
-    }
-
-    // 8의 배수 패딩
-    while ((uint64_t)ptr % 8 != 0) {
-        ptr--;
-    }
-
-    // 주소 값 메모리에 넣기
-    int addr_idx = index - 1;
-    ptr -= 8;
-    while (addr_idx >= 0) {
-        ptr -= 8;
-        memcpy(ptr, &address[addr_idx--], 8);
-    }
-
-    // return address 넣기
-    ptr -= 8;
-
-    if_->rsp = (uint64_t)ptr;
-    if_->R.rdi = index;             // argc
-    if_->R.rsi = (uint64_t)ptr + 8; // argv 배열의 첫번째 주소
+    /* TODO: Your code goes here.
+     * TODO: Implement argument passing (see project2/argument_passing.html). */
 
     success = true;
 
@@ -665,14 +695,3 @@ static bool setup_stack(struct intr_frame* if_)
     return success;
 }
 #endif /* VM */
-
-void get_file_name_only(const char* original_f_name, char* f_name_only, char** save_ptr)
-{
-    char buffer[15], *f_name_tmp;
-
-    strlcpy(buffer, original_f_name, sizeof(buffer));
-    buffer[14] = '\0';
-    f_name_tmp = strtok_r(buffer, " ", save_ptr);
-
-    strlcpy(f_name_only, f_name_tmp, strlen(f_name_tmp) + 1);
-}
