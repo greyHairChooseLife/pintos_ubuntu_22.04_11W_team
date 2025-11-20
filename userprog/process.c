@@ -18,6 +18,8 @@
 #include "threads/mmu.h"
 #include "threads/vaddr.h"
 #include "intrinsic.h"
+#include "include/devices/timer.h"
+
 #ifdef VM
 #include "vm/vm.h"
 #endif
@@ -52,7 +54,7 @@ tid_t process_create_initd(const char* file_name)
 
     /* thread_name parsing logic necessary due to thread name size limit declared in thread.h */
     /* this logic was chosen instead of strtok which damages original string */
-    char thread_name[16];
+    char thread_name[16];               // thread_name length is max 15 bytes.
     size_t len = strcspn(fn_copy, " "); // returns length of initial segment up til rejected character
     if (len >= sizeof(thread_name))     // logic to prevent buffer over flow
         len = sizeof(thread_name) - 1;
@@ -180,7 +182,8 @@ void arg_passing(void* f_line, struct intr_frame* _if)
     // parse and push arguments into stack at the same time
     // simultaneously add argv_address within stack
     for (token = strtok_r(f_line, " ", &save_ptr); token != NULL; token = strtok_r(NULL, " ", &save_ptr)) {
-        if (*token == '\0') continue;
+        if (*token == '\0')
+            continue;
         int len = strlen(token) + 1;
         rsp -= len;
         memcpy(rsp, token, len);
@@ -188,15 +191,12 @@ void arg_passing(void* f_line, struct intr_frame* _if)
     }
 
     // inserting padding if needed after finishing pushing in strings
-    int padding = (uintptr_t)rsp % 8;
-    if (padding > 0) {
-        rsp -= padding;
-        memset(rsp, 0, padding);
-    }
+    // no need to add 0 since when page_get_alloc, stack is zero-filled.
+    while ((uintptr_t)rsp % 8 != 0)
+        rsp--;
 
     // insert sentinel argv[argc] = NULL;
     rsp -= 8;
-    *(char**)rsp = 0;
 
     // add in argv_address into rsp
     for (int i = argc - 1; i >= 0; i--) {
@@ -206,7 +206,6 @@ void arg_passing(void* f_line, struct intr_frame* _if)
 
     // insert fake address
     rsp -= 8;
-    *(char**)rsp = 0;
 
     // set register values
     _if->R.rdi = argc;               // argc
@@ -234,13 +233,13 @@ int process_exec(void* f_name)
 
     /* file name parsing logic necessary before passing on to load*/
     /* same logic from parsing thread_name in process_create_initd */
-    char load_name[64];                     // if this is too short load might fail
-    size_t len = strcspn(file_name, " ");   // returns length of initial segment up til rejected character
-    if (len >= sizeof(load_name))           // logic to prevent buffer over flow
+    char load_name[15];                   // load_name is max 14 bytes, +1 for null terminator
+    size_t len = strcspn(file_name, " "); // returns length of initial segment up til rejected character
+    if (len >= sizeof(load_name))         // logic to prevent buffer over flow
         len = sizeof(load_name) - 1;
 
     memcpy(load_name, file_name, len); // copy name
-    load_name[len] = '\0';          // implement null termination
+    load_name[len] = '\0';             // implement null termination
     /* And then load the binary */
     success = load(load_name, &_if);
     /* If load failed, quit. */
@@ -248,7 +247,7 @@ int process_exec(void* f_name)
         return -1;
 
     arg_passing(file_name, &_if);
-    
+
     // move palloc_free_page after arg_passing()
     palloc_free_page(file_name);
 
@@ -280,11 +279,11 @@ void process_exit(void)
 {
     struct thread* curr = thread_current();
 
-    /* TODO: Your code goes here.
-     * TODO: Implement process termination message (see
-     * TODO: project2/process_termination.html).
-     * TODO: We recommend you to implement process resource cleanup here. */
-    printf("%s: exit(%d)\n", curr->name, curr->exit_status);
+// using preprocessor directives (전처리기 지시문) ==> 코드를 조건부로 컴파일.
+#ifdef USERPROG             // only if user program
+    if (curr->pml4 != NULL) // means thread running user code (kernel thread does not have user memory space pml4)
+        printf("%s: exit(%d)\n", curr->name, curr->exit_status);
+#endif
 
     process_cleanup();
 }
@@ -411,7 +410,6 @@ static bool load(const char* file_name, struct intr_frame* if_)
         goto done;
     }
 
-
     /* Read and verify executable header. */
     if (file_read(file, &ehdr, sizeof ehdr) != sizeof ehdr || memcmp(ehdr.e_ident, "\177ELF\2\1\1", 7) ||
         ehdr.e_type != 2 || ehdr.e_machine != 0x3E // amd64
@@ -419,7 +417,6 @@ static bool load(const char* file_name, struct intr_frame* if_)
         printf("load: %s: error loading executable\n", file_name);
         goto done;
     }
-
 
     /* Read program headers. */
     file_ofs = ehdr.e_phoff;
