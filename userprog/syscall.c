@@ -35,7 +35,7 @@ void syscall_init(void)
 {
     write_msr(MSR_STAR, ((uint64_t)SEL_UCSEG - 0x10) << 48 | ((uint64_t)SEL_KCSEG) << 32);
     write_msr(MSR_LSTAR, (uint64_t)syscall_entry);
-    
+
     /* The interrupt service rountine should not serve any interrupts
      * until the syscall_entry swaps the userland stack to the kernel
      * mode stack. Therefore, we masked the FLAG_FL. */
@@ -55,7 +55,6 @@ void syscall_handler(struct intr_frame* f UNUSED)
     uint64_t arg5 = f->R.r8;
     uint64_t arg6 = f->R.r9;
 
-
     switch (syscall_num) {
 
     case SYS_EXIT:
@@ -63,6 +62,9 @@ void syscall_handler(struct intr_frame* f UNUSED)
         break;
 
     case SYS_CREATE:
+        if (!arg1)
+            exit(-1);
+
         if (strlen(arg1) > 14) // 14자 제한
             return 0;
 
