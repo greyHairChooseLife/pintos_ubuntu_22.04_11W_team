@@ -12,11 +12,14 @@
 void syscall_entry(void);
 void syscall_handler(struct intr_frame*);
 
-#define MAX_CHUNK 256 /* 콘솔 출력 청크 사이즈 */
+#define MAX_CHUNK 256                      /* 콘솔 출력 청크 사이즈 */
+#define CODE_SEGMENT ((uint64_t)0x0400000) /* 코드 세그먼트 시작 주소 */
 
 static struct lock lock;
 static void exit(int status);
+static int create(char* file_name, int initial_size);
 static int write(int fd, const void* buffer, unsigned size);
+static void check_valid_ptr(int count, ...);
 
 /* System call.
  *
@@ -35,7 +38,7 @@ void syscall_init(void)
 {
     write_msr(MSR_STAR, ((uint64_t)SEL_UCSEG - 0x10) << 48 | ((uint64_t)SEL_KCSEG) << 32);
     write_msr(MSR_LSTAR, (uint64_t)syscall_entry);
-    
+
     /* The interrupt service rountine should not serve any interrupts
      * until the syscall_entry swaps the userland stack to the kernel
      * mode stack. Therefore, we masked the FLAG_FL. */
@@ -55,15 +58,20 @@ void syscall_handler(struct intr_frame* f UNUSED)
     uint64_t arg5 = f->R.r8;
     uint64_t arg6 = f->R.r9;
 
-
     switch (syscall_num) {
 
     case SYS_EXIT:
         exit(arg1);
         break;
+
+    case SYS_CREATE:
+        f->R.rax = create(arg1, arg2);
+        break;
+
     case SYS_WRITE:
         f->R.rax = write(arg1, arg2, arg3);
         break;
+
     default:
         thread_exit();
     }
@@ -76,8 +84,24 @@ static void exit(int status)
     thread_exit();
 }
 
-int write(int fd, const void* buffer, unsigned size)
+static int create(char* file_name, int initial_size)
 {
+    if (!file_name) // Check NULL
+        exit(-1);
+
+    check_valid_ptr(1, file_name); // Check valid ptr
+
+    lock_acquire(&lock); // 동시 접근 방지
+    int result = filesys_create(file_name, initial_size);
+    lock_release(&lock);
+
+    return result;
+}
+
+static int write(int fd, const void* buffer, unsigned size)
+{
+    check_valid_ptr(1, buffer); // Check valid ptr
+
     lock_acquire(&lock); // race condition 방지
     char* buf = (char*)buffer;
 
@@ -94,4 +118,37 @@ int write(int fd, const void* buffer, unsigned size)
     lock_release(&lock);
 
     return size;
+}
+
+/**
+ * Implement user memory access (Check allocated-ptr/kernel-memory-ptr/partially-valid-ptr)
+ *
+ * 검증하고자 하는 주소 값만 인자로 전달합니다.
+ * only call by reference argument
+ */
+static void check_valid_ptr(int count, ...)
+{
+    /**
+     * code segment 시작주소
+     * See: lib/user/user.Ids:7-13
+     * See: Makefile.userprog:9
+     * See: userprog/process.c:445-468
+     */
+
+    va_list ptr_ap;
+    va_start(ptr_ap, count);
+
+    for (int i = 0; i < count; i++) {
+        uint64_t ptr = va_arg(ptr_ap, uint64_t);
+
+        bool not_user_segment = ptr < CODE_SEGMENT || ptr > USER_STACK;
+        bool not_allocated = pml4_get_page(thread_current()->pml4, ptr) == NULL;
+
+        if (not_user_segment || not_allocated) {
+            va_end(ptr_ap);
+            exit(-1);
+        }
+    }
+
+    va_end(ptr_ap);
 }
