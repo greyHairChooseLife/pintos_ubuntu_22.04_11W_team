@@ -12,10 +12,12 @@
 void syscall_entry(void);
 void syscall_handler(struct intr_frame*);
 
-#define MAX_CHUNK 256 /* 콘솔 출력 청크 사이즈 */
+#define MAX_CHUNK 256                      /* 콘솔 출력 청크 사이즈 */
+#define CODE_SEGMENT ((uint64_t)0x0400000) /* 코드 세그먼트 시작 주소 */
 
 static struct lock lock;
 static void exit(int status);
+static int create(char* file_name, int initial_size);
 static int write(int fd, const void* buffer, unsigned size);
 static bool is_valid_ptr(int count, ...);
 
@@ -63,17 +65,7 @@ void syscall_handler(struct intr_frame* f UNUSED)
         break;
 
     case SYS_CREATE:
-        if (!arg1) // Check NULL
-            exit(-1);
-
-        if (!is_valid_ptr(1, arg1)) // Check valid ptr
-            exit(-1);
-
-        lock_acquire(&lock); // 동시 접근 방지
-        int result = filesys_create(arg1, arg2);
-        lock_release(&lock);
-
-        f->R.rax = result;
+        f->R.rax = create(arg1, arg2);
         break;
 
     case SYS_WRITE:
@@ -90,6 +82,21 @@ static void exit(int status)
     struct thread* t = thread_current();
     t->exit_status = status;
     thread_exit();
+}
+
+static int create(char* file_name, int initial_size)
+{
+    if (!file_name) // Check NULL
+        exit(-1);
+
+    if (!is_valid_ptr(1, file_name)) // Check valid ptr
+        exit(-1);
+
+    lock_acquire(&lock); // 동시 접근 방지
+    int result = filesys_create(file_name, initial_size);
+    lock_release(&lock);
+
+    return result;
 }
 
 static int write(int fd, const void* buffer, unsigned size)
@@ -126,8 +133,6 @@ static bool is_valid_ptr(int count, ...)
      * See: Makefile.userprog:9
      * See: userprog/process.c:445-468
      */
-    const uint64_t CODE_SEGMENT = 0x0400000ULL;
-
     bool is_valid = true;
 
     va_list ptr_ap;
