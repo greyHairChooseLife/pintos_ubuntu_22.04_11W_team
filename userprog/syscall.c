@@ -19,7 +19,7 @@ static struct lock lock;
 static void exit(int status);
 static int create(char* file_name, int initial_size);
 static int write(int fd, const void* buffer, unsigned size);
-static bool is_valid_ptr(int count, ...);
+static void check_valid_ptr(int count, ...);
 
 /* System call.
  *
@@ -89,8 +89,7 @@ static int create(char* file_name, int initial_size)
     if (!file_name) // Check NULL
         exit(-1);
 
-    if (!is_valid_ptr(1, file_name)) // Check valid ptr
-        exit(-1);
+    check_valid_ptr(1, file_name); // Check valid ptr
 
     lock_acquire(&lock); // 동시 접근 방지
     int result = filesys_create(file_name, initial_size);
@@ -101,6 +100,8 @@ static int create(char* file_name, int initial_size)
 
 static int write(int fd, const void* buffer, unsigned size)
 {
+    check_valid_ptr(1, buffer); // Check valid ptr
+
     lock_acquire(&lock); // race condition 방지
     char* buf = (char*)buffer;
 
@@ -125,7 +126,7 @@ static int write(int fd, const void* buffer, unsigned size)
  * 검증하고자 하는 주소 값만 인자로 전달합니다.
  * only call by reference argument
  */
-static bool is_valid_ptr(int count, ...)
+static void check_valid_ptr(int count, ...)
 {
     /**
      * code segment 시작주소
@@ -133,7 +134,6 @@ static bool is_valid_ptr(int count, ...)
      * See: Makefile.userprog:9
      * See: userprog/process.c:445-468
      */
-    bool is_valid = true;
 
     va_list ptr_ap;
     va_start(ptr_ap, count);
@@ -141,16 +141,14 @@ static bool is_valid_ptr(int count, ...)
     for (int i = 0; i < count; i++) {
         uint64_t ptr = va_arg(ptr_ap, uint64_t);
 
-        bool is_user_segment = !(ptr < CODE_SEGMENT || ptr > USER_STACK);
-        bool is_allocated = NULL != pml4_get_page(thread_current()->pml4, ptr);
+        bool not_user_segment = ptr < CODE_SEGMENT || ptr > USER_STACK;
+        bool not_allocated = pml4_get_page(thread_current()->pml4, ptr) == NULL;
 
-        if (!(is_user_segment && is_allocated)) {
-            is_valid = false;
-            break;
+        if (not_user_segment || not_allocated) {
+            va_end(ptr_ap);
+            exit(-1);
         }
     }
 
     va_end(ptr_ap);
-
-    return is_valid;
 }
