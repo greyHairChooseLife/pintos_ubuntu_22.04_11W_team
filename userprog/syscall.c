@@ -116,24 +116,40 @@ static int create(char* file_name, int initial_size)
 
 static int write(int fd, const void* buffer, unsigned size)
 {
-    check_valid_ptr(1, buffer);
+    check_valid_zone(buffer, size); // Check buffer validity
 
     lock_acquire(&lock); // race condition 방지
-    char* buf = (char*)buffer;
-
-    if (size <= MAX_CHUNK) {
-        putbuf(buf, size);
-    } else { // 256 이상은 분할 출력
-        size_t offset = 0;
-        while (offset < size) {
-            size_t chunk_size = size - offset < MAX_CHUNK ? size - offset : MAX_CHUNK;
-            putbuf(buf + offset, chunk_size);
-            offset += chunk_size;
+    if (fd == 0) {
+        lock_release(&lock);
+        return -1;
+    }
+    if (fd == 1) {
+        if (size <= MAX_CHUNK) {
+            putbuf(buffer, size);
+            lock_release(&lock);
+            return size;
+        } else { // 256 이상은 분할 출력
+            size_t offset = 0;
+            while (offset < size) {
+                size_t chunk_size = size - offset < MAX_CHUNK ? size - offset : MAX_CHUNK;
+                putbuf(buffer + offset, chunk_size);
+                offset += chunk_size;
+            }
+            lock_release(&lock);
+            return offset;
         }
     }
-    lock_release(&lock);
+    struct file_descriptor* real_fd = find_fd(fd);
+    // don't use check_valid_ptr() here because real_fd is in kernel heap
+    // malloc is used in syscall.c whilst kernel mode
+    if (real_fd == NULL) {
+        lock_release(&lock);
+        exit(-1);
+    }
 
-    return size;
+    size_t ofs = file_write(real_fd->fd_file, buffer, size);
+    lock_release(&lock);
+    return ofs;
 }
 
 /**
@@ -154,21 +170,19 @@ static void check_valid_ptr(int count, ...)
 
     for (int i = 0; i < count; i++) {
         uint64_t ptr = va_arg(ptr_ap, uint64_t);
-
-        // Check NULL
+        // 무조건 단락 나누기 필요.
         if (ptr == NULL) {
             va_end(ptr_ap);
             exit(-1);
         }
 
-        // Check user segment
-        if (ptr < CODE_SEGMENT || ptr >= USER_STACK) {
+        if (!is_user_vaddr(ptr)) {
             va_end(ptr_ap);
             exit(-1);
         }
-
-        // Check memory allocated
-        if (pml4_get_page(thread_current()->pml4, ptr) == NULL) {
+        // only check after validating if null pointer or valid user address,
+        // or else kernel panic insidepml4_get_page() when checking valid user address
+        if (pml4_get_page(thread_current()->pml4, (void*)ptr) == NULL) {
             va_end(ptr_ap);
             exit(-1);
         }
@@ -294,7 +308,7 @@ static int32_t filesize(int fd)
         lock_release(&lock);
         return -1;
     }
-    
+
     int32_t size = file_length(real_fd->fd_file);
     lock_release(&lock);
     return size;
@@ -309,7 +323,7 @@ static struct file_descriptor* find_fd(int fd)
         return NULL;
     }
 
-    struct list_elem* e = NULL;
+    struct list_elem* e = NULL; 
     // traverse through files_opened of current thread to find matching fd_val
     for (e = list_begin(&t->files_opened); e != list_end(&t->files_opened); e = list_next(e)) {
         struct file_descriptor* real_fd = list_entry(e, struct file_descriptor, fd_elem);
