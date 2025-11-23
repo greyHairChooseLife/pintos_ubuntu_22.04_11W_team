@@ -138,10 +138,12 @@ static int read(int fd, void* buffer, unsigned size)
      */
 
     check_valid_fd(fd);
+    check_valid_ptr(buffer);
 
     struct thread* curr = thread_current();
+    struct file* f = curr->fdte[fd];
 
-    return file_read(curr->fdte[fd], buffer, size);
+    return f != NULL ? file_read(f, buffer, size) : -1;
 }
 
 static int write(int fd, const void* buffer, unsigned size)
