@@ -146,22 +146,29 @@ static int write(int fd, const void* buffer, unsigned size)
 {
     check_valid_ptr(1, buffer);
 
-    lock_acquire(&lock); // race condition 방지
-    char* buf = (char*)buffer;
+    if (fd == 1) {
 
-    if (size <= MAX_CHUNK) {
-        putbuf(buf, size);
-    } else { // 256 이상은 분할 출력
-        size_t offset = 0;
-        while (offset < size) {
-            size_t chunk_size = size - offset < MAX_CHUNK ? size - offset : MAX_CHUNK;
-            putbuf(buf + offset, chunk_size);
-            offset += chunk_size;
+        lock_acquire(&lock); // race condition 방지
+        char* buf = (char*)buffer;
+
+        if (size <= MAX_CHUNK) {
+            putbuf(buf, size);
+        } else { // 256 이상은 분할 출력
+            size_t offset = 0;
+            while (offset < size) {
+                size_t chunk_size = size - offset < MAX_CHUNK ? size - offset : MAX_CHUNK;
+                putbuf(buf + offset, chunk_size);
+                offset += chunk_size;
+            }
         }
-    }
-    lock_release(&lock);
+        lock_release(&lock);
 
-    return size;
+        return size;
+    } else {
+        check_valid_fd(fd);
+
+        return file_write(thread_current()->fdte[fd], buffer, size); // 내부 lock 구현됨
+    }
 }
 
 static int open(const char* file_name)
