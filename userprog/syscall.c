@@ -129,13 +129,9 @@ static int filesize(int fd)
 
 static int read(int fd, void* buffer, unsigned size)
 {
-
-    /**
-      fd 로 열린 파일에서 size 바이트를 buffer 로 읽는다.
-      실제 읽은 바이트 수를 반환한다 (EOF에서 0).
-      읽을 수 없는 경우 -1.
-      fd 0 은 키보드 입력을 input_getc() 로 읽는다.
-     */
+    if (fd == 0) {
+        return input_getc(); // 키보드 입력 읽기
+    }
 
     check_valid_fd(fd);
     check_valid_ptr(buffer);
