@@ -133,7 +133,9 @@ static int open(const char* file_name)
 {
     check_valid_ptr(1, file_name);
 
+    lock_acquire(&lock);
     struct file* f = filesys_open(file_name);
+    lock_release(&lock);
 
     if (f == NULL) { // file 오픈 실패
         return -1;
@@ -163,7 +165,9 @@ static void close(int fd)
 
     struct thread* curr = thread_current();
 
+    lock_acquire(&lock);
     file_close(curr->fdte[fd]); // open_cnt 보고 inode 제거
+    lock_release(&lock);
 
     curr->fdte[fd] = NULL; // remove fdte
 }
