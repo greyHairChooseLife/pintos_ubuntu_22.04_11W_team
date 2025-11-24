@@ -170,18 +170,21 @@ static void check_valid_ptr(int count, ...)
 
     for (int i = 0; i < count; i++) {
         uint64_t ptr = va_arg(ptr_ap, uint64_t);
+
         // Check NULL
         if (ptr == NULL) {
             va_end(ptr_ap);
             exit(-1);
         }
+
         // check user segment
         if (ptr < CODE_SEGMENT || ptr >= USER_STACK) {
             va_end(ptr_ap);
             exit(-1);
         }
+
         // Check memory allocated
-        if (pml4_get_page(thread_current()->pml4, (void*)ptr) == NULL) {
+        if (pml4_get_page(thread_current()->pml4, ptr) == NULL) {
             va_end(ptr_ap);
             exit(-1);
         }
@@ -322,7 +325,7 @@ static struct file_descriptor* find_fd(int fd)
         return NULL;
     }
 
-    struct list_elem* e = NULL; 
+    struct list_elem* e = NULL;
     // traverse through files_opened of current thread to find matching fd_val
     for (e = list_begin(&t->files_opened); e != list_end(&t->files_opened); e = list_next(e)) {
         struct file_descriptor* real_fd = list_entry(e, struct file_descriptor, fd_elem);
