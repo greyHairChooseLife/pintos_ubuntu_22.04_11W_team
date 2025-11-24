@@ -27,7 +27,6 @@ static void check_valid_ptr(int count, ...);
 static int read(int fd, void* buffer, unsigned size);
 static int filesize(int fd);
 
-
 /* System call.
  *
  * Previously system call services was handled by the interrupt handler
@@ -86,7 +85,7 @@ void syscall_handler(struct intr_frame* f UNUSED)
     case SYS_CLOSE:
         close(arg1);
         break;
-    
+
     case SYS_READ:
         f->R.rax = read(arg1, arg2, arg3);
         break;
@@ -139,15 +138,14 @@ static int write(int fd, const void* buffer, unsigned size)
             }
             lock_release(&lock);
             return offset;
-
         }
     }
 
-    if (fd < MIN_FD || fd > MAX_FD) 
+    if (fd < MIN_FD || fd > MAX_FD)
         exit(-1);
 
     struct thread* curr = thread_current();
-    struct file *f = curr->fdte[fd];
+    struct file* f = curr->fdte[fd];
 
     int bytes_written = file_write(f, buffer, size);
     lock_release(&lock);
@@ -239,38 +237,33 @@ static void check_valid_ptr(int count, ...)
     va_end(ptr_ap);
 }
 
+static int read(int fd, void* buffer, unsigned size)
+{
+    check_valid_ptr(1, buffer);
 
-static int read(int fd, void* buffer, unsigned size) {
-    
     if (fd < MIN_FD || fd > MAX_FD)
         exit(-1);
 
-    struct thread *t = thread_current();
-
-    struct file *f = t->fdte[fd];
+    struct thread* t = thread_current();
+    struct file* f = t->fdte[fd];
 
     lock_acquire(&lock);
     int byte_read = file_read(f, buffer, size);
     lock_release(&lock);
 
-    if (byte_read == NULL)
-        return -1;
-
     return byte_read;
-
 }
 
-
-static int filesize(int fd) {
+static int filesize(int fd)
+{
 
     if (fd < MIN_FD || fd > MAX_FD)
         exit(-1);
 
-    struct thread *t = thread_current();
-    struct file *f = t->fdte[fd];
+    struct thread* t = thread_current();
+    struct file* f = t->fdte[fd];
     lock_acquire(&lock);
     size_t size = file_length(f);
     lock_release(&lock);
     return size;
-
 }
