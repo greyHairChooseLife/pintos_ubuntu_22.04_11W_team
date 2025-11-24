@@ -21,7 +21,7 @@ static struct lock lock;
 static void exit(int status);
 static int create(char* file_name, int initial_size);
 static int write(int fd, const void* buffer, unsigned size);
-static int open(const void* file_name);
+static int open(const char* file_name);
 static void close(int fd);
 static void check_valid_ptr(int count, ...);
 
@@ -129,7 +129,7 @@ static int write(int fd, const void* buffer, unsigned size)
     return size;
 }
 
-static int open(const void* file_name)
+static int open(const char* file_name)
 {
     check_valid_ptr(1, file_name);
 
