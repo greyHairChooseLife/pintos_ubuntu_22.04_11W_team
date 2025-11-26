@@ -17,8 +17,7 @@
 void syscall_entry(void);
 void syscall_handler(struct intr_frame*);
 
-#define MAX_CHUNK 256                      /* 콘솔 출력 청크 사이즈 */
-#define CODE_SEGMENT ((uint64_t)0x0400000) /* 코드 세그먼트 시작 주소 */
+#define MAX_CHUNK 256 /* 콘솔 출력 청크 사이즈 */
 
 static struct lock lock;
 static void exit(int status);

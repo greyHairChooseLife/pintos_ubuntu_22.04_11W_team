@@ -170,8 +170,10 @@ static bool duplicate_pte(uint64_t* pte, void* va, void* aux)
     bool writable;
 
     /* 1. If the parent_page is kernel page, then return immediately. */
-    if (is_kernel_vaddr(va)) // FIXME: ptr < CODE_SEGMENT || ptr >= USER_STACK
-        return true;         // FIXME: false
+    /* 부모의 유저 공간만 복사하므로, 복사 대상이 아니면 건너뛰고 진행. */
+    /* 그래서 true를 반환 */
+    if (va < CODE_SEGMENT || va >= USER_STACK)
+        return true;
 
     /* 2. Resolve VA from the parent's page map level 4. */
     parent_page = pml4_get_page(parent->pml4, va);

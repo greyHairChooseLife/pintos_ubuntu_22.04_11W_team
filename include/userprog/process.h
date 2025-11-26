@@ -4,6 +4,8 @@
 #include "threads/synch.h"
 #include "threads/thread.h"
 
+#define CODE_SEGMENT ((uint64_t)0x0400000) /* 코드 세그먼트 시작 주소 */
+
 struct fork_aux {
     struct thread* parent;
     struct intr_frame* if_parent;
