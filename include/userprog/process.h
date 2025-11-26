@@ -1,7 +1,17 @@
 #ifndef USERPROG_PROCESS_H
 #define USERPROG_PROCESS_H
 
+#include "threads/synch.h"
 #include "threads/thread.h"
+
+struct fork_aux {
+    struct thread* parent;
+    struct intr_frame* if_parent;
+
+    struct semaphore loaded;
+    bool success;
+    struct child_thread* ch;
+};
 
 tid_t process_create_initd(const char* file_name);
 tid_t process_fork(const char* name, struct intr_frame* if_);
