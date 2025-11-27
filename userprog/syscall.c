@@ -17,9 +17,14 @@
 void syscall_entry(void);
 void syscall_handler(struct intr_frame*);
 
-#define MAX_CHUNK 256 /* 콘솔 출력 청크 사이즈 */
+#define CONSOLE_RING_SIZE 1024 /* 콘솔 링버퍼 크기 */
+#define CONSOLE_CHUNK 256      /* 콘솔 flush 시 출력 청크 크기 */
 
 static struct lock lock;
+static struct lock console_buffer_lock;
+static char console_ring[CONSOLE_RING_SIZE];
+static size_t console_ring_len;
+
 static void exit(int status);
 static int fork(const char* thread_name, struct intr_frame* f);
 static int exec(const char* cmd_line);
@@ -32,6 +37,8 @@ static void check_valid_ptr(int count, ...);
 static int read(int fd, void* buffer, unsigned size);
 static int filesize(int fd);
 static void check_valid_fd(int fd);
+static void flush_console_buffer(void);
+static void enqueue_console_output(const char* buf, size_t size);
 
 /* System call.
  *
@@ -56,6 +63,7 @@ void syscall_init(void)
      * mode stack. Therefore, we masked the FLAG_FL. */
     write_msr(MSR_SYSCALL_MASK, FLAG_IF | FLAG_TF | FLAG_DF | FLAG_IOPL | FLAG_AC | FLAG_NT);
     lock_init(&lock);
+    lock_init(&console_buffer_lock);
 }
 
 /* The main system call interface */
@@ -197,18 +205,8 @@ static int write(int fd, const void* buffer, unsigned size)
     // need to add logic to check entire buffer
 
     if (fd == 1) {
-        char* buf = (char*)buffer;
-
-        if (size <= MAX_CHUNK) {
-            putbuf(buf, size);
-        } else { // 256 이상은 분할 출력
-            size_t offset = 0;
-            while (offset < size) {
-                size_t chunk_size = size - offset < MAX_CHUNK ? size - offset : MAX_CHUNK;
-                putbuf((char*)buf + offset, chunk_size);
-                offset += chunk_size;
-            }
-        }
+        enqueue_console_output((char*)buffer, size);
+        flush_console_buffer();
         return size;
     }
 
@@ -222,6 +220,55 @@ static int write(int fd, const void* buffer, unsigned size)
     lock_release(&lock);
 
     return bytes_written;
+}
+
+/* 콘솔 출력 링버퍼로 enqueue */
+static void enqueue_console_output(const char* buf, size_t size)
+{
+    size_t offset = 0;
+
+    while (offset < size) {
+        lock_acquire(&console_buffer_lock);
+        size_t space = CONSOLE_RING_SIZE - console_ring_len;
+        if (space == 0) {
+            lock_release(&console_buffer_lock);
+            flush_console_buffer();
+            continue;
+        }
+
+        size_t chunk = size - offset;
+        if (chunk > space)
+            chunk = space;
+
+        memcpy(console_ring + console_ring_len, buf + offset, chunk);
+        console_ring_len += chunk;
+        offset += chunk;
+        lock_release(&console_buffer_lock);
+    }
+}
+
+/* 링버퍼에 모인 데이터를 실제 콘솔로 flush */
+static void flush_console_buffer(void)
+{
+
+    char local[CONSOLE_CHUNK];
+    size_t chunk;
+
+    lock_acquire(&console_buffer_lock);
+    if (console_ring_len == 0) {
+        lock_release(&console_buffer_lock);
+        return;
+    }
+
+    chunk = console_ring_len;
+    if (chunk > CONSOLE_CHUNK)
+        chunk = CONSOLE_CHUNK;
+    memcpy(local, console_ring, chunk);
+    memmove(console_ring, console_ring + chunk, console_ring_len - chunk);
+    console_ring_len -= chunk;
+    lock_release(&console_buffer_lock);
+
+    putbuf(local, chunk);
 }
 
 static int open(const char* file_name)
