@@ -224,6 +224,13 @@ static void __do_fork(void* aux)
         goto error;
 #endif
     /* 파일 복사 */
+    if (parent->execute_file != NULL) {
+        struct file* dup_execute_file = file_duplicate(parent->execute_file);
+        if (dup_execute_file == NULL)
+            goto error;
+        current->execute_file = dup_execute_file;
+    }
+
     for (int i = MIN_FD; i < MAX_FD; i++) { // fdte 전수 조사
         if (parent->fdte[i] != NULL) {
             struct file* f = file_duplicate(parent->fdte[i]);
@@ -307,6 +314,7 @@ int process_exec(void* f_name)
 {
     char* file_name = f_name;
     bool success;
+    struct thread* curr = thread_current();
 
     /* We cannot use the intr_frame in the thread structure.
      * This is because when current thread rescheduled,
@@ -317,6 +325,11 @@ int process_exec(void* f_name)
     _if.eflags = FLAG_IF | FLAG_MBS;
 
     /* We first kill the current context */
+    if (curr->execute_file != NULL) {
+        file_allow_write(curr->execute_file);
+        file_close(curr->execute_file);
+        curr->execute_file = NULL;
+    }
     process_cleanup();
 
     /* file name parsing logic necessary before passing on to load*/
@@ -391,9 +404,16 @@ void process_exit(void)
     }
 
 #endif
-
-    file_allow_write(curr->execute_file);
-    file_close(curr->execute_file);
+    for (int i = MIN_FD; i < MAX_FD; i++) {
+        if (curr->fdte[i] != NULL) {
+            file_close(curr->fdte[i]);
+            curr->fdte[i] = NULL;
+        }
+    }
+    if (curr->execute_file != NULL) {
+        file_allow_write(curr->execute_file);
+        file_close(curr->execute_file);
+    }
 
     process_cleanup();
 }
@@ -587,12 +607,6 @@ static bool load(const char* file_name, struct intr_frame* if_)
 
     file_deny_write(file);
     t->execute_file = file;
-
-    int fd = new_fd(t, file);
-    if (fd == -1) {
-        exit(-1);
-    } else
-        t->fdte[fd] = file; // file descriptor table entry 생성
 
     success = true;
 
@@ -853,7 +867,7 @@ static void parse_thread_name(const char* cmdline, char name[16])
 int new_fd(struct thread* t, struct file* f)
 {
     // 3부터 순회 -> 빈 순번 할당
-    for (int i = MIN_FD; i <= MAX_FD; i++) {
+    for (int i = MIN_FD; i < MAX_FD; i++) {
         if (t->fdte[i] == NULL) {
             return i;
         }

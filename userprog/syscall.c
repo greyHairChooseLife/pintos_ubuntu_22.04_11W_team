@@ -36,6 +36,7 @@ static void close(int fd);
 static void check_valid_ptr(int count, ...);
 static int read(int fd, void* buffer, unsigned size);
 static int filesize(int fd);
+static void seek(int fd, unsigned position);
 static void check_valid_fd(int fd);
 static void flush_console_buffer(void);
 static void enqueue_console_output(const char* buf, size_t size);
@@ -118,6 +119,10 @@ void syscall_handler(struct intr_frame* f UNUSED)
 
     case SYS_FILESIZE:
         f->R.rax = filesize(arg1);
+        break;
+
+    case SYS_SEEK:
+        seek((int)arg1, (unsigned)arg2);
         break;
 
     default:
@@ -281,27 +286,29 @@ static int open(const char* file_name)
 
     lock_acquire(&lock);
 
-    if (strcmp(curr->name, file_name) == 0) { /* 현재 프로세스와 open 파일이 동일한 경우 */
-        f = curr->execute_file;
-        for (int i = MIN_FD; i <= MAX_FD; i++) {
-            if (curr->fdte[i] == f) {
-                fd = i;
-                break;
-            }
+    if (strcmp(curr->name, file_name) == 0 &&
+        curr->execute_file != NULL) { /* 현재 프로세스와 open 파일이 동일한 경우 */
+        f = file_duplicate(curr->execute_file);
+        if (f == NULL) {
+            lock_release(&lock);
+            return -1;
         }
     } else { /* 새로 파일을 open 하는 경우 */
         f = filesys_open(file_name);
 
         if (f == NULL) { // file 오픈 실패
+            lock_release(&lock);
             return -1;
         }
-
-        fd = new_fd(curr, f);
-        if (fd == -1) {
-            exit(-1);
-        } else
-            curr->fdte[fd] = f; // file descriptor table entry 생성
     }
+
+    fd = new_fd(curr, f);
+    if (fd == -1) {
+        file_close(f);
+        lock_release(&lock);
+        exit(-1);
+    } else
+        curr->fdte[fd] = f; // file descriptor table entry 생성
 
     lock_release(&lock);
 
@@ -388,6 +395,18 @@ static int filesize(int fd)
     size_t size = file_length(f);
     lock_release(&lock);
     return size;
+}
+
+static void seek(int fd, unsigned position)
+{
+    check_valid_fd(fd);
+
+    struct thread* t = thread_current();
+    struct file* f = t->fdte[fd];
+
+    lock_acquire(&lock);
+    file_seek(f, position);
+    lock_release(&lock);
 }
 
 static void check_valid_fd(int fd)
