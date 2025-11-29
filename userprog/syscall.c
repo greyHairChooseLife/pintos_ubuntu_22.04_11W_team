@@ -11,8 +11,11 @@
 #include "threads/flags.h"
 #include "intrinsic.h"
 #include "threads/synch.h"
+#include "threads/init.h"
 #include "userprog/process.h"
+#include <stdbool.h>
 #include <string.h>
+#include <debug.h>
 
 void syscall_entry(void);
 void syscall_handler(struct intr_frame*);
@@ -20,23 +23,26 @@ void syscall_handler(struct intr_frame*);
 #define CONSOLE_RING_SIZE 1024 /* 콘솔 링버퍼 크기 */
 #define CONSOLE_CHUNK 256      /* 콘솔 flush 시 출력 청크 크기 */
 
-static struct lock lock;
+struct lock filesys_lock; /* 파일 시스템 전역 락 */
 static struct lock console_buffer_lock;
 static char console_ring[CONSOLE_RING_SIZE];
 static size_t console_ring_len;
 
+static void halt(void) NO_RETURN;
 void exit(int status);
 static int sys_fork(const char* thread_name, struct intr_frame* f);
 static int exec(const char* cmd_line);
 static int wait(int pid);
 static int create(char* file_name, int initial_size);
-static int write(int fd, const void* buffer, unsigned size);
+static bool remove_file(const char* file_name);
 static int open(const char* file_name);
+static int filesize(int fd);
+static int read(int fd, void* buffer, unsigned size);
+static int write(int fd, const void* buffer, unsigned size);
+static void seek(int fd, unsigned position);
+static unsigned tell(int fd);
 static void close(int fd);
 static void check_valid_ptr(int count, ...);
-static int read(int fd, void* buffer, unsigned size);
-static int filesize(int fd);
-static void seek(int fd, unsigned position);
 static void check_valid_fd(int fd);
 static void flush_console_buffer(void);
 static void enqueue_console_output(const char* buf, size_t size);
@@ -63,7 +69,7 @@ void syscall_init(void)
      * until the syscall_entry swaps the userland stack to the kernel
      * mode stack. Therefore, we masked the FLAG_FL. */
     write_msr(MSR_SYSCALL_MASK, FLAG_IF | FLAG_TF | FLAG_DF | FLAG_IOPL | FLAG_AC | FLAG_NT);
-    lock_init(&lock);
+    lock_init(&filesys_lock);
     lock_init(&console_buffer_lock);
 }
 
@@ -76,54 +82,56 @@ void syscall_handler(struct intr_frame* f UNUSED)
     uint64_t arg3 = f->R.rdx;
 
     switch (syscall_num) {
-
+    case SYS_HALT:
+        halt();
+        break;
     case SYS_EXIT:
         exit((int)arg1);
         break;
-
     case SYS_FORK:
         f->R.rax = sys_fork((const char*)arg1, f);
         break;
-
     case SYS_EXEC:
         f->R.rax = exec((const char*)arg1);
         break;
-
     case SYS_WAIT:
         f->R.rax = wait((int)arg1);
         break;
-
     case SYS_CREATE:
         f->R.rax = create((char*)arg1, (int)arg2);
         break;
-
-    case SYS_WRITE:
-        f->R.rax = write((int)arg1, (const void*)arg2, (unsigned)arg3);
+    case SYS_REMOVE:
+        f->R.rax = remove_file((const char*)arg1);
         break;
-
     case SYS_OPEN:
         f->R.rax = open((const char*)arg1);
         break;
-
-    case SYS_CLOSE:
-        close((int)arg1);
-        break;
-
-    case SYS_READ:
-        f->R.rax = read((int)arg1, (void*)arg2, (unsigned)arg3);
-        break;
-
     case SYS_FILESIZE:
         f->R.rax = filesize((int)arg1);
         break;
-
+    case SYS_READ:
+        f->R.rax = read((int)arg1, (void*)arg2, (unsigned)arg3);
+        break;
+    case SYS_WRITE:
+        f->R.rax = write((int)arg1, (const void*)arg2, (unsigned)arg3);
+        break;
     case SYS_SEEK:
         seek((int)arg1, (unsigned)arg2);
         break;
-
+    case SYS_TELL:
+        f->R.rax = tell((int)arg1);
+        break;
+    case SYS_CLOSE:
+        close((int)arg1);
+        break;
     default:
         thread_exit();
     }
+}
+
+static void halt(void)
+{
+    power_off();
 }
 
 void exit(int status)
@@ -146,8 +154,10 @@ static int sys_fork(const char* thread_name, struct intr_frame* f)
 
     /* parent intr frame을 커널 영역으로 복사 */
     struct intr_frame* parent_tf_copy = palloc_get_page(0);
-    if (parent_tf_copy == NULL)
+    if (parent_tf_copy == NULL) {
+        palloc_free_page(tn_copy);
         return TID_ERROR;
+    }
     memcpy(parent_tf_copy, f, sizeof(struct intr_frame));
 
     tid_t tid = process_fork(tn_copy, parent_tf_copy);
@@ -193,11 +203,88 @@ static int create(char* file_name, int initial_size)
 {
     check_valid_ptr(1, file_name);
 
-    lock_acquire(&lock); // 동시 접근 방지
+    lock_acquire(&filesys_lock); // 동시 접근 방지
     int result = filesys_create(file_name, initial_size);
-    lock_release(&lock);
+    lock_release(&filesys_lock);
 
     return result;
+}
+
+static bool remove_file(const char* file_name)
+{
+    check_valid_ptr(1, file_name);
+
+    lock_acquire(&filesys_lock);
+    bool result = filesys_remove(file_name);
+    lock_release(&filesys_lock);
+    return result;
+}
+
+static int open(const char* file_name)
+{
+    check_valid_ptr(1, file_name);
+
+    struct file* f;
+    struct thread* curr = thread_current();
+    int fd = -1;
+
+    lock_acquire(&filesys_lock);
+
+    if (strcmp(curr->name, file_name) == 0 &&
+        curr->execute_file != NULL) { /* 현재 프로세스와 open 파일이 동일한 경우 */
+        f = file_duplicate(curr->execute_file);
+        if (f == NULL) {
+            lock_release(&filesys_lock);
+            return -1;
+        }
+    } else { /* 새로 파일을 open 하는 경우 */
+        f = filesys_open(file_name);
+
+        if (f == NULL) { // file 오픈 실패
+            lock_release(&filesys_lock);
+            return -1;
+        }
+    }
+
+    fd = new_fd(curr, f);
+    if (fd == -1) {
+        file_close(f);
+        lock_release(&filesys_lock);
+        return -1;
+    } else
+        curr->fdte[fd] = f; // file descriptor table entry 생성
+
+    lock_release(&filesys_lock);
+
+    return fd;
+}
+
+static int filesize(int fd)
+{
+    check_valid_fd(fd);
+
+    struct thread* t = thread_current();
+    struct file* f = t->fdte[fd];
+    lock_acquire(&filesys_lock);
+    size_t size = file_length(f);
+    lock_release(&filesys_lock);
+    return size;
+}
+
+static int read(int fd, void* buffer, unsigned size)
+{
+    check_valid_ptr(1, buffer);
+
+    check_valid_fd(fd);
+
+    struct thread* t = thread_current();
+    struct file* f = t->fdte[fd];
+
+    lock_acquire(&filesys_lock);
+    int byte_read = file_read(f, buffer, size);
+    lock_release(&filesys_lock);
+
+    return byte_read;
 }
 
 static int write(int fd, const void* buffer, unsigned size)
@@ -216,11 +303,99 @@ static int write(int fd, const void* buffer, unsigned size)
     struct thread* curr = thread_current();
     struct file* f = curr->fdte[fd];
 
-    lock_acquire(&lock);
+    lock_acquire(&filesys_lock);
     int bytes_written = file_write(f, buffer, size);
-    lock_release(&lock);
+    lock_release(&filesys_lock);
 
     return bytes_written;
+}
+
+static void seek(int fd, unsigned position)
+{
+    check_valid_fd(fd);
+
+    struct thread* t = thread_current();
+    struct file* f = t->fdte[fd];
+
+    lock_acquire(&filesys_lock);
+    file_seek(f, position);
+    lock_release(&filesys_lock);
+}
+
+static unsigned tell(int fd)
+{
+    check_valid_fd(fd);
+
+    struct thread* t = thread_current();
+    struct file* f = t->fdte[fd];
+
+    lock_acquire(&filesys_lock);
+    off_t pos = file_tell(f);
+    lock_release(&filesys_lock);
+
+    return (unsigned)pos;
+}
+
+static void close(int fd)
+{
+    check_valid_fd(fd);
+
+    struct thread* curr = thread_current();
+
+    lock_acquire(&filesys_lock);
+    file_close(curr->fdte[fd]); // open_cnt 보고 inode 제거
+    lock_release(&filesys_lock);
+
+    curr->fdte[fd] = NULL; // remove fdte
+}
+
+/**
+ * Implement user memory access
+ * Check allocated-ptr / kernel-memory-ptr / partially-valid-ptr
+ *
+ * Args: 검증하고자 하는 주소 값만 인자로 전달 (only call-by-ref arg)
+ *
+ * Code Segment 시작주소
+ * See: lib/user/user.Ids:7-13
+ * See: Makefile.userprog:9
+ * See: userprog/process.c:445-468
+ */
+static void check_valid_ptr(int count, ...)
+{
+    va_list ptr_ap;
+    va_start(ptr_ap, count);
+
+    for (int i = 0; i < count; i++) {
+        void* ptr = va_arg(ptr_ap, void*);
+
+        // Check NULL
+        if (ptr == NULL) {
+            va_end(ptr_ap);
+            exit(-1);
+        }
+
+        // Check user segment
+        if ((uint64_t)ptr < CODE_SEGMENT || (uint64_t)ptr >= USER_STACK) {
+            va_end(ptr_ap);
+            exit(-1);
+        }
+
+        // Check memory allocated
+        if (pml4_get_page(thread_current()->pml4, ptr) == NULL) {
+            va_end(ptr_ap);
+            exit(-1);
+        }
+    }
+
+    va_end(ptr_ap);
+}
+static void check_valid_fd(int fd)
+{
+    if (fd < MIN_FD || fd > MAX_FD)
+        exit(-1);
+
+    if (thread_current()->fdte[fd] == NULL)
+        exit(-1);
 }
 
 /* 콘솔 출력 링버퍼로 enqueue */
@@ -270,146 +445,4 @@ static void flush_console_buffer(void)
     lock_release(&console_buffer_lock);
 
     putbuf(local, chunk);
-}
-
-static int open(const char* file_name)
-{
-    check_valid_ptr(1, file_name);
-
-    struct file* f;
-    struct thread* curr = thread_current();
-    int fd = -1;
-
-    lock_acquire(&lock);
-
-    if (strcmp(curr->name, file_name) == 0 &&
-        curr->execute_file != NULL) { /* 현재 프로세스와 open 파일이 동일한 경우 */
-        f = file_duplicate(curr->execute_file);
-        if (f == NULL) {
-            lock_release(&lock);
-            return -1;
-        }
-    } else { /* 새로 파일을 open 하는 경우 */
-        f = filesys_open(file_name);
-
-        if (f == NULL) { // file 오픈 실패
-            lock_release(&lock);
-            return -1;
-        }
-    }
-
-    fd = new_fd(curr, f);
-    if (fd == -1) {
-        file_close(f);
-        lock_release(&lock);
-        exit(-1);
-    } else
-        curr->fdte[fd] = f; // file descriptor table entry 생성
-
-    lock_release(&lock);
-
-    return fd;
-}
-
-static void close(int fd)
-{
-    check_valid_fd(fd);
-
-    struct thread* curr = thread_current();
-
-    lock_acquire(&lock);
-    file_close(curr->fdte[fd]); // open_cnt 보고 inode 제거
-    lock_release(&lock);
-
-    curr->fdte[fd] = NULL; // remove fdte
-}
-
-/**
- * Implement user memory access
- * Check allocated-ptr / kernel-memory-ptr / partially-valid-ptr
- *
- * Args: 검증하고자 하는 주소 값만 인자로 전달 (only call-by-ref arg)
- *
- * Code Segment 시작주소
- * See: lib/user/user.Ids:7-13
- * See: Makefile.userprog:9
- * See: userprog/process.c:445-468
- */
-static void check_valid_ptr(int count, ...)
-{
-    va_list ptr_ap;
-    va_start(ptr_ap, count);
-
-    for (int i = 0; i < count; i++) {
-        void* ptr = va_arg(ptr_ap, void*);
-
-        // Check NULL
-        if (ptr == NULL) {
-            va_end(ptr_ap);
-            exit(-1);
-        }
-
-        // Check user segment
-        if ((uint64_t)ptr < CODE_SEGMENT || (uint64_t)ptr >= USER_STACK) {
-            va_end(ptr_ap);
-            exit(-1);
-        }
-
-        // Check memory allocated
-        if (pml4_get_page(thread_current()->pml4, ptr) == NULL) {
-            va_end(ptr_ap);
-            exit(-1);
-        }
-    }
-
-    va_end(ptr_ap);
-}
-
-static int read(int fd, void* buffer, unsigned size)
-{
-    check_valid_ptr(1, buffer);
-
-    check_valid_fd(fd);
-
-    struct thread* t = thread_current();
-    struct file* f = t->fdte[fd];
-
-    lock_acquire(&lock);
-    int byte_read = file_read(f, buffer, size);
-    lock_release(&lock);
-
-    return byte_read;
-}
-
-static int filesize(int fd)
-{
-    check_valid_fd(fd);
-
-    struct thread* t = thread_current();
-    struct file* f = t->fdte[fd];
-    lock_acquire(&lock);
-    size_t size = file_length(f);
-    lock_release(&lock);
-    return size;
-}
-
-static void seek(int fd, unsigned position)
-{
-    check_valid_fd(fd);
-
-    struct thread* t = thread_current();
-    struct file* f = t->fdte[fd];
-
-    lock_acquire(&lock);
-    file_seek(f, position);
-    lock_release(&lock);
-}
-
-static void check_valid_fd(int fd)
-{
-    if (fd < MIN_FD || fd > MAX_FD)
-        exit(-1);
-
-    if (thread_current()->fdte[fd] == NULL)
-        exit(-1);
 }
