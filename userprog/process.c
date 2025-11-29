@@ -20,6 +20,7 @@
 #include "threads/vaddr.h"
 #include "intrinsic.h"
 #include "include/devices/timer.h"
+#include "userprog/syscall.h"
 
 #ifdef VM
 #include "vm/vm.h"
@@ -135,6 +136,11 @@ tid_t process_fork(const char* name, struct intr_frame* if_ UNUSED)
     /* Clone current thread to new thread.*/
     tid_t child_tid = thread_create(name, PRI_DEFAULT, __do_fork, &aux);
 
+    if (child_tid == TID_ERROR) {
+        palloc_free_page(child);
+        return TID_ERROR;
+    }
+
     /* 부모에 자식 등록 */
     list_push_back(&current->children, &child->elem);
 
@@ -224,22 +230,28 @@ static void __do_fork(void* aux)
         goto error;
 #endif
     /* 파일 복사 */
+    lock_acquire(&filesys_lock);
     if (parent->execute_file != NULL) {
         struct file* dup_execute_file = file_duplicate(parent->execute_file);
-        if (dup_execute_file == NULL)
+        if (dup_execute_file == NULL) {
+            lock_release(&filesys_lock);
             goto error;
+        }
         current->execute_file = dup_execute_file;
     }
 
-    for (int i = MIN_FD; i < MAX_FD; i++) { // fdte 전수 조사
+    for (int i = MIN_FD; i <= MAX_FD; i++) { // fdte 전수 조사
         if (parent->fdte[i] != NULL) {
             struct file* f = file_duplicate(parent->fdte[i]);
-            if (f == NULL)
+            if (f == NULL) {
+                lock_release(&filesys_lock);
                 goto error;
+            }
 
             current->fdte[i] = f;
         }
     }
+    lock_release(&filesys_lock);
 
     /* 자식 상태 설정 */
     f_aux->ch->tid = current->tid;
@@ -325,10 +337,12 @@ int process_exec(void* f_name)
     _if.eflags = FLAG_IF | FLAG_MBS;
 
     /* We first kill the current context */
+    lock_acquire(&filesys_lock);
     if (curr->execute_file != NULL) {
         file_close(curr->execute_file);
         curr->execute_file = NULL;
     }
+    lock_release(&filesys_lock);
     process_cleanup();
 
     /* file name parsing logic necessary before passing on to load*/
@@ -341,7 +355,9 @@ int process_exec(void* f_name)
     memcpy(load_name, file_name, len); // copy name
     load_name[len] = '\0';             // implement null termination
     /* And then load the binary */
+    lock_acquire(&filesys_lock);
     success = load(load_name, &_if);
+    lock_release(&filesys_lock);
     /* If load failed, quit. */
     if (!success)
         return -1;
@@ -403,7 +419,8 @@ void process_exit(void)
     }
 
 #endif
-    for (int i = MIN_FD; i < MAX_FD; i++) {
+    lock_acquire(&filesys_lock);
+    for (int i = MIN_FD; i <= MAX_FD; i++) {
         if (curr->fdte[i] != NULL) {
             file_close(curr->fdte[i]);
             curr->fdte[i] = NULL;
@@ -412,6 +429,7 @@ void process_exit(void)
     if (curr->execute_file != NULL) {
         file_close(curr->execute_file);
     }
+    lock_release(&filesys_lock);
 
     process_cleanup();
 }
@@ -865,7 +883,7 @@ static void parse_thread_name(const char* cmdline, char name[16])
 int new_fd(struct thread* t, struct file* f)
 {
     // 3부터 순회 -> 빈 순번 할당
-    for (int i = MIN_FD; i < MAX_FD; i++) {
+    for (int i = MIN_FD; i <= MAX_FD; i++) {
         if (t->fdte[i] == NULL) {
             return i;
         }

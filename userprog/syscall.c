@@ -11,8 +11,11 @@
 #include "threads/flags.h"
 #include "intrinsic.h"
 #include "threads/synch.h"
+#include "threads/init.h"
 #include "userprog/process.h"
+#include <stdbool.h>
 #include <string.h>
+#include <debug.h>
 
 void syscall_entry(void);
 void syscall_handler(struct intr_frame*);
@@ -20,7 +23,7 @@ void syscall_handler(struct intr_frame*);
 #define CONSOLE_RING_SIZE 1024 /* 콘솔 링버퍼 크기 */
 #define CONSOLE_CHUNK 256      /* 콘솔 flush 시 출력 청크 크기 */
 
-static struct lock lock;
+struct lock filesys_lock; /* 파일 시스템 전역 락 */
 static struct lock console_buffer_lock;
 static char console_ring[CONSOLE_RING_SIZE];
 static size_t console_ring_len;
@@ -37,6 +40,9 @@ static void check_valid_ptr(int count, ...);
 static int read(int fd, void* buffer, unsigned size);
 static int filesize(int fd);
 static void seek(int fd, unsigned position);
+static unsigned tell(int fd);
+static bool remove_file(const char* file_name);
+static void halt(void) NO_RETURN;
 static void check_valid_fd(int fd);
 static void flush_console_buffer(void);
 static void enqueue_console_output(const char* buf, size_t size);
@@ -63,7 +69,7 @@ void syscall_init(void)
      * until the syscall_entry swaps the userland stack to the kernel
      * mode stack. Therefore, we masked the FLAG_FL. */
     write_msr(MSR_SYSCALL_MASK, FLAG_IF | FLAG_TF | FLAG_DF | FLAG_IOPL | FLAG_AC | FLAG_NT);
-    lock_init(&lock);
+    lock_init(&filesys_lock);
     lock_init(&console_buffer_lock);
 }
 
@@ -81,6 +87,10 @@ void syscall_handler(struct intr_frame* f UNUSED)
         exit((int)arg1);
         break;
 
+    case SYS_HALT:
+        halt();
+        break;
+
     case SYS_FORK:
         f->R.rax = sys_fork((const char*)arg1, f);
         break;
@@ -95,6 +105,10 @@ void syscall_handler(struct intr_frame* f UNUSED)
 
     case SYS_CREATE:
         f->R.rax = create((char*)arg1, (int)arg2);
+        break;
+
+    case SYS_REMOVE:
+        f->R.rax = remove_file((const char*)arg1);
         break;
 
     case SYS_WRITE:
@@ -121,6 +135,10 @@ void syscall_handler(struct intr_frame* f UNUSED)
         seek((int)arg1, (unsigned)arg2);
         break;
 
+    case SYS_TELL:
+        f->R.rax = tell((int)arg1);
+        break;
+
     default:
         thread_exit();
     }
@@ -132,6 +150,11 @@ void exit(int status)
 
     t->exit_status = status;
     thread_exit();
+}
+
+static void halt(void)
+{
+    power_off();
 }
 
 static int sys_fork(const char* thread_name, struct intr_frame* f)
@@ -146,8 +169,10 @@ static int sys_fork(const char* thread_name, struct intr_frame* f)
 
     /* parent intr frame을 커널 영역으로 복사 */
     struct intr_frame* parent_tf_copy = palloc_get_page(0);
-    if (parent_tf_copy == NULL)
+    if (parent_tf_copy == NULL) {
+        palloc_free_page(tn_copy);
         return TID_ERROR;
+    }
     memcpy(parent_tf_copy, f, sizeof(struct intr_frame));
 
     tid_t tid = process_fork(tn_copy, parent_tf_copy);
@@ -193,9 +218,9 @@ static int create(char* file_name, int initial_size)
 {
     check_valid_ptr(1, file_name);
 
-    lock_acquire(&lock); // 동시 접근 방지
+    lock_acquire(&filesys_lock); // 동시 접근 방지
     int result = filesys_create(file_name, initial_size);
-    lock_release(&lock);
+    lock_release(&filesys_lock);
 
     return result;
 }
@@ -216,9 +241,9 @@ static int write(int fd, const void* buffer, unsigned size)
     struct thread* curr = thread_current();
     struct file* f = curr->fdte[fd];
 
-    lock_acquire(&lock);
+    lock_acquire(&filesys_lock);
     int bytes_written = file_write(f, buffer, size);
-    lock_release(&lock);
+    lock_release(&filesys_lock);
 
     return bytes_written;
 }
@@ -280,20 +305,20 @@ static int open(const char* file_name)
     struct thread* curr = thread_current();
     int fd = -1;
 
-    lock_acquire(&lock);
+    lock_acquire(&filesys_lock);
 
     if (strcmp(curr->name, file_name) == 0 &&
         curr->execute_file != NULL) { /* 현재 프로세스와 open 파일이 동일한 경우 */
         f = file_duplicate(curr->execute_file);
         if (f == NULL) {
-            lock_release(&lock);
+            lock_release(&filesys_lock);
             return -1;
         }
     } else { /* 새로 파일을 open 하는 경우 */
         f = filesys_open(file_name);
 
         if (f == NULL) { // file 오픈 실패
-            lock_release(&lock);
+            lock_release(&filesys_lock);
             return -1;
         }
     }
@@ -301,12 +326,12 @@ static int open(const char* file_name)
     fd = new_fd(curr, f);
     if (fd == -1) {
         file_close(f);
-        lock_release(&lock);
-        exit(-1);
+        lock_release(&filesys_lock);
+        return -1;
     } else
         curr->fdte[fd] = f; // file descriptor table entry 생성
 
-    lock_release(&lock);
+    lock_release(&filesys_lock);
 
     return fd;
 }
@@ -317,9 +342,9 @@ static void close(int fd)
 
     struct thread* curr = thread_current();
 
-    lock_acquire(&lock);
+    lock_acquire(&filesys_lock);
     file_close(curr->fdte[fd]); // open_cnt 보고 inode 제거
-    lock_release(&lock);
+    lock_release(&filesys_lock);
 
     curr->fdte[fd] = NULL; // remove fdte
 }
@@ -374,9 +399,9 @@ static int read(int fd, void* buffer, unsigned size)
     struct thread* t = thread_current();
     struct file* f = t->fdte[fd];
 
-    lock_acquire(&lock);
+    lock_acquire(&filesys_lock);
     int byte_read = file_read(f, buffer, size);
-    lock_release(&lock);
+    lock_release(&filesys_lock);
 
     return byte_read;
 }
@@ -387,9 +412,9 @@ static int filesize(int fd)
 
     struct thread* t = thread_current();
     struct file* f = t->fdte[fd];
-    lock_acquire(&lock);
+    lock_acquire(&filesys_lock);
     size_t size = file_length(f);
-    lock_release(&lock);
+    lock_release(&filesys_lock);
     return size;
 }
 
@@ -400,9 +425,33 @@ static void seek(int fd, unsigned position)
     struct thread* t = thread_current();
     struct file* f = t->fdte[fd];
 
-    lock_acquire(&lock);
+    lock_acquire(&filesys_lock);
     file_seek(f, position);
-    lock_release(&lock);
+    lock_release(&filesys_lock);
+}
+
+static unsigned tell(int fd)
+{
+    check_valid_fd(fd);
+
+    struct thread* t = thread_current();
+    struct file* f = t->fdte[fd];
+
+    lock_acquire(&filesys_lock);
+    off_t pos = file_tell(f);
+    lock_release(&filesys_lock);
+
+    return (unsigned)pos;
+}
+
+static bool remove_file(const char* file_name)
+{
+    check_valid_ptr(1, file_name);
+
+    lock_acquire(&filesys_lock);
+    bool ok = filesys_remove(file_name);
+    lock_release(&filesys_lock);
+    return ok;
 }
 
 static void check_valid_fd(int fd)

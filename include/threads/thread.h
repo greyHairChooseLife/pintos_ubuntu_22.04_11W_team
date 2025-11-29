@@ -126,7 +126,7 @@ struct thread {
 #ifdef USERPROG
     /* Owned by userprog/process.c. */
     uint64_t* pml4;                     /* Page map level 4 */
-    struct file* fdte[MAX_FD];          /* file descriptor table */
+    struct file* fdte[MAX_FD + 1];      /* file descriptor table */
     struct thread* parent;              /* 부모 프로세스 */
     struct child_thread* self_metadata; /* 부모가 가진 현재 프로세스 메타데이터 연결고리 */
     struct list children;               /* 자식 프로세스 목록 */
